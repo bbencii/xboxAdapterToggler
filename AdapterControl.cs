@@ -12,15 +12,19 @@ internal sealed class AdapterControl
     private string? _instanceId;
     public string NameMatch { get; set; } = "";
     public string? DeviceName { get; private set; }
+    public string? InstanceId => _instanceId;
+    public uint? DeviceProblem { get; private set; }
 
     public AdapterState GetState()
     {
+        DeviceProblem = null;
         if (_instanceId is null || !Native.TryGetStatus(_instanceId, out _, out _))
             Find();
 
         if (_instanceId is null || !Native.TryGetStatus(_instanceId, out uint status, out uint problem))
             return AdapterState.NotFound;
 
+        DeviceProblem = problem;
         if (problem == Native.CM_PROB_DISABLED)
             return AdapterState.Disabled;
         return (status & Native.DN_STARTED) != 0 ? AdapterState.Enabled : AdapterState.Problem;
@@ -31,7 +35,16 @@ internal sealed class AdapterControl
         if (GetState() == AdapterState.NotFound || _instanceId is null)
             throw new InvalidOperationException($"Device matching \"{NameMatch}\" not found.");
 
-        Native.ChangeState(_instanceId, enable);
+        try
+        {
+            Native.ChangeState(_instanceId, enable);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Failed to {(enable ? "enable" : "disable")} device \"{DeviceName}\" " +
+                $"(instance ID: {_instanceId}): {ex.Message}", ex);
+        }
 
         // device state changes can take a moment to settle.
         var expected = enable ? AdapterState.Enabled : AdapterState.Disabled;
@@ -41,13 +54,20 @@ internal sealed class AdapterControl
                 return;
             Thread.Sleep(250);
         }
-        throw new InvalidOperationException("Windows accepted the change, but the device did not switch. A restart may be required.");
+        AdapterState finalState = GetState();
+        if (finalState == expected)
+            return;
+        throw new InvalidOperationException(
+            $"Windows accepted the request to {(enable ? "enable" : "disable")} device \"{DeviceName}\" " +
+            $"(instance ID: {_instanceId}), but its state is still {finalState} " +
+            $"(configuration problem code: {DeviceProblem?.ToString() ?? "unavailable"}). A restart may be required.");
     }
 
     private void Find()
     {
         _instanceId = null;
         DeviceName = null;
+        DeviceProblem = null;
         if (string.IsNullOrWhiteSpace(NameMatch))
             return;
 
@@ -147,12 +167,20 @@ internal sealed class AdapterControl
             var results = new List<(string, string)>();
             IntPtr set = SetupDiGetClassDevsW(IntPtr.Zero, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_ALLCLASSES);
             if (set == INVALID_HANDLE_VALUE)
-                throw new Win32Exception();
+                throw SetupApiException(nameof(SetupDiGetClassDevsW), Marshal.GetLastWin32Error());
             try
             {
                 var data = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
-                for (uint i = 0; SetupDiEnumDeviceInfo(set, i, ref data); i++)
+                for (uint i = 0; ; i++)
                 {
+                    if (!SetupDiEnumDeviceInfo(set, i, ref data))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == ERROR_NO_MORE_ITEMS)
+                            break;
+                        throw SetupApiException(nameof(SetupDiEnumDeviceInfo), error);
+                    }
+
                     string? name = GetStringProperty(set, ref data, SPDRP_FRIENDLYNAME)
                                    ?? GetStringProperty(set, ref data, SPDRP_DEVICEDESC);
                     if (name is null)
@@ -161,8 +189,6 @@ internal sealed class AdapterControl
                     if (SetupDiGetDeviceInstanceIdW(set, ref data, id, id.Capacity, out _))
                         results.Add((id.ToString(), name));
                 }
-                if (Marshal.GetLastWin32Error() is var err && err != ERROR_NO_MORE_ITEMS && err != 0)
-                    throw new Win32Exception(err);
             }
             finally
             {
@@ -175,12 +201,12 @@ internal sealed class AdapterControl
         {
             IntPtr set = SetupDiCreateDeviceInfoList(IntPtr.Zero, IntPtr.Zero);
             if (set == INVALID_HANDLE_VALUE)
-                throw new Win32Exception();
+                throw SetupApiException(nameof(SetupDiCreateDeviceInfoList), Marshal.GetLastWin32Error());
             try
             {
                 var data = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
                 if (!SetupDiOpenDeviceInfoW(set, instanceId, IntPtr.Zero, 0, ref data))
-                    throw new Win32Exception();
+                    throw SetupApiException(nameof(SetupDiOpenDeviceInfoW), Marshal.GetLastWin32Error());
 
                 var p = new SP_PROPCHANGE_PARAMS
                 {
@@ -194,14 +220,21 @@ internal sealed class AdapterControl
                     HwProfile = 0,
                 };
                 if (!SetupDiSetClassInstallParamsW(set, ref data, ref p, Marshal.SizeOf<SP_PROPCHANGE_PARAMS>()))
-                    throw new Win32Exception();
+                    throw SetupApiException(nameof(SetupDiSetClassInstallParamsW), Marshal.GetLastWin32Error());
                 if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, ref data))
-                    throw new Win32Exception();
+                    throw SetupApiException(nameof(SetupDiCallClassInstaller), Marshal.GetLastWin32Error());
             }
             finally
             {
                 SetupDiDestroyDeviceInfoList(set);
             }
+        }
+
+        private static Win32Exception SetupApiException(string function, int errorCode)
+        {
+            var nativeException = new Win32Exception(errorCode);
+            return new Win32Exception(errorCode,
+                $"{function} failed with Win32 error {errorCode} (0x{errorCode:X8}): {nativeException.Message}");
         }
 
         private static string? GetStringProperty(IntPtr set, ref SP_DEVINFO_DATA data, uint property)

@@ -30,9 +30,9 @@ internal sealed class Settings
             if (File.Exists(FilePath))
                 return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath), JsonOptions) ?? new Settings();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // fallback to defaults on a corrupted json file
+            AppLog.WriteError($"Failed to load settings from \"{FilePath}\"; using defaults.", ex);
         }
 
         var defaults = new Settings();

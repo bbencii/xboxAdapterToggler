@@ -109,6 +109,8 @@ internal sealed class TrayContext : ApplicationContext
         catch (Exception ex)
         {
             _state = AdapterState.NotFound;
+            AppLog.WriteError($"Failed to query adapter state. Name match: \"{_adapter.NameMatch}\"; " +
+                              $"device: \"{_adapter.DeviceName ?? "unknown"}\"; instance ID: \"{_adapter.InstanceId ?? "unknown"}\".", ex);
             Debug.WriteLine(ex);
         }
 
@@ -214,6 +216,7 @@ internal sealed class TrayContext : ApplicationContext
         }
         catch (Exception ex)
         {
+            AppLog.WriteError("Failed to change the Windows startup task.", ex);
             _tray.ShowBalloonTip(5000, "AdapterToggle – failed", ex.Message, ToolTipIcon.Error);
         }
         _startupItem.Checked = StartupTask.IsRegistered();
